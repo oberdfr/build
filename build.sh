@@ -10,10 +10,13 @@ OUT_DIR="$ROOT_DIR/out"
 DIST_DIR="$ROOT_DIR/dist"
 KERNEL_DIR="$ROOT_DIR/kernel"
 DT_CONFIGS="$ROOT_DIR/dt-configs"
+FSTAB_DIR="$ROOT_DIR/fstab"
 
 MKDTIMG="$ROOT_DIR/mkdtimg/mkdtimg"
 MKBOOTIMG="python3 $ROOT_DIR/mkbootimg/mkbootimg.py"
 AVBTOOL="python3 $ROOT_DIR/external_avb/avbtool.py"
+FSTAB_FILE="$ROOT_DIR/fstab/fstab.exynos2100"
+FIRST_STAGE_FSTAB_FILE="$ROOT_DIR/fstab/first_stage-fstab.exynos2100"
 
 DEVICE="o1s"  # Default device
 ARCH="arm64"
@@ -133,11 +136,11 @@ fi
 cd $KERNEL_DIR
 # 1. Generate defconfig
 echo -e "${YELLOW}Generating defconfig...${NC}"
-make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG"
+# make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG"
 
 # 2. Build kernel
 echo -e "${YELLOW}Building kernel image...${NC}"
-make O="$OUT_DIR" ARCH="$ARCH" -j"$JOBS"
+# make O="$OUT_DIR" ARCH="$ARCH" -j"$JOBS"
 
 cd $ROOT_DIR
 # --- BUILD KERNEL END --- #
@@ -217,17 +220,17 @@ if [ -d "$DIST_DIR/lib/modules" ]; then
     cp -r "$DIST_DIR/lib/modules"/* "$TEMP_VENDOR_RAMDISK/lib/modules/"
 
     # Copy fstab file to vendor ramdisk
-    if [ -f "$ROOT_DIR/fstab/fstab.exynos2100" ]; then
-        cp "$ROOT_DIR/fstab/fstab.exynos2100" "$TEMP_VENDOR_RAMDISK/"
+    if [ -f $FSTAB_FILE ]; then
+        cp $FSTAB_FILE "$TEMP_VENDOR_RAMDISK/"
     else
         echo -e "${RED}Error: fstab.exynos2100 not found in stock ramdisk.${NC}"
         exit 1
     fi
 
     # Add first stage ramdisk to vendor ramdisk
-    if [ -f "$ROOT_DIR/first-stage_fstab/fstab.exynos2100" ]; then
+    if [ -f $FIRST_STAGE_FSTAB_FILE ]; then
         mkdir -p "$TEMP_VENDOR_RAMDISK/first_stage_ramdisk"
-        cp -r "$ROOT_DIR/first-stage_fstab/fstab.exynos2100" "$TEMP_VENDOR_RAMDISK/first_stage_ramdisk/"
+        cp -r $FIRST_STAGE_FSTAB_FILE "$TEMP_VENDOR_RAMDISK/first_stage_ramdisk/fstab.exynos2100"
     else
         echo -e "${YELLOW}Warning: First stage ramdisk folder not found in stock ramdisk. Proceeding without it.${NC}"
     fi
