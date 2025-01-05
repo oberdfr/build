@@ -9,14 +9,20 @@ JOBS=$(nproc)
 OUT_DIR="$ROOT_DIR/out"
 DIST_DIR="$ROOT_DIR/dist"
 KERNEL_DIR="$ROOT_DIR/kernel"
+VENDOR_BOOT_RAMDISK_DIR="$ROOT_DIR/vendor_boot_ramdisk"
 DT_CONFIGS="$ROOT_DIR/dt-configs"
-FSTAB_DIR="$ROOT_DIR/fstab"
+FSTAB_DIR="$VENDOR_BOOT_RAMDISK_DIR/fstab"
+RAMDISK_DIR="$ROOT_DIR/boot_ramdisk"
+VENDOR_FIRMWARE_DIR="$VENDOR_BOOT_RAMDISK_DIR/vendor/firmware"
+
+FSTAB_FILE="$FSTAB_DIR/fstab.exynos2100"
+FIRST_STAGE_FSTAB_FILE="$FSTAB_DIR/first_stage-fstab.exynos2100"
+MODULES_LOAD="$VENDOR_BOOT_RAMDISK_DIR/modules-load/modules.load"
 
 MKDTIMG="$ROOT_DIR/mkdtimg/mkdtimg"
 MKBOOTIMG="python3 $ROOT_DIR/mkbootimg/mkbootimg.py"
 AVBTOOL="python3 $ROOT_DIR/external_avb/avbtool.py"
-FSTAB_FILE="$ROOT_DIR/fstab/fstab.exynos2100"
-FIRST_STAGE_FSTAB_FILE="$ROOT_DIR/fstab/first_stage-fstab.exynos2100"
+GENERATE_MODULE_DEP="$ROOT_DIR/build/generate_modules_dependencies.py"
 
 DEVICE="o1s"  # Default device
 ARCH="arm64"
@@ -80,7 +86,7 @@ export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p "$OUT_DIR"
 
 # Signing variables
-GKI_SIGNING_KEY="$ROOT_DIR/keys/private_key.pem"
+GKI_SIGNING_KEY="$ROOT_DIR/keys/testkey_rsa4096.pem"
 GKI_SIGNING_ALGORITHM="SHA256_RSA4096"
 GKI_SIGNING_AVBTOOL="$AVBTOOL"
 
@@ -127,7 +133,7 @@ if ! command -v $AVBTOOL &> /dev/null; then
 fi
 
 # Check for keys
-if [ ! -f "$ROOT_DIR/keys/private_key.pem" ] || [ ! -f "$ROOT_DIR/keys/public_key_metadata.bin" ]; then
+if [ ! -f "$GKI_SIGNING_KEY" ] ; then
     echo -e "${RED}Error: Keys not found in $ROOT_DIR/keys.${NC}"
     exit 1
 fi
@@ -136,11 +142,11 @@ fi
 cd $KERNEL_DIR
 # 1. Generate defconfig
 echo -e "${YELLOW}Generating defconfig...${NC}"
-# make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG"
+make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG"
 
 # 2. Build kernel
 echo -e "${YELLOW}Building kernel image...${NC}"
-# make O="$OUT_DIR" ARCH="$ARCH" -j"$JOBS"
+make O="$OUT_DIR" ARCH="$ARCH" -j"$JOBS"
 
 cd $ROOT_DIR
 # --- BUILD KERNEL END --- #
@@ -179,18 +185,48 @@ else
     exit 1
 fi
 
-# 5. Create boot.img
+# Create boot ramdisk CPIO archive
+echo -e "${YELLOW}Creating boot ramdisk...${NC}"
+if [ -d "$RAMDISK_DIR" ]; then
+    # Create temporary directory for ramdisk
+    TEMP_RAMDISK="$DIST_DIR/temp_ramdisk"
+    mkdir -p "$TEMP_RAMDISK"
+    
+    # Copy ramdisk contents
+    cp -r "$RAMDISK_DIR"/* "$TEMP_RAMDISK/"
+    
+    # Set proper permissions for init
+    chmod 750 "$TEMP_RAMDISK/init"
+    
+    # Create symbolic links if they don't exist
+    mkdir -p "$TEMP_RAMDISK/dev"
+    [ ! -L "$TEMP_RAMDISK/dev/console" ] && ln -sf /dev/console "$TEMP_RAMDISK/dev/console.lnk"
+    [ ! -L "$TEMP_RAMDISK/dev/null" ] && ln -sf /dev/null "$TEMP_RAMDISK/dev/null.lnk"
+    [ ! -L "$TEMP_RAMDISK/dev/urandom" ] && ln -sf /dev/urandom "$TEMP_RAMDISK/dev/urandom.lnk"
+    
+    # Create ramdisk CPIO archive
+    ( cd "$TEMP_RAMDISK" && \
+        find . | cpio -H newc -o | gzip > "$DIST_DIR/ramdisk.cpio.gz" )
+    
+    rm -rf "$TEMP_RAMDISK"
+else
+    echo -e "${RED}Error: Boot ramdisk directory not found: $RAMDISK_DIR${NC}"
+    exit 1
+fi
+
+# 5. Create boot.img with ramdisk
 echo -e "${YELLOW}Creating boot.img...${NC}"
 $MKBOOTIMG \
     --kernel "$OUT_DIR/arch/$ARCH/boot/Image" \
+    --ramdisk "$DIST_DIR/ramdisk.cpio.gz" \
     --pagesize 4096 \
     --base 0x00000000 \
     --kernel_offset 0x80008000 \
+    --ramdisk_offset 0x84000000 \
     --header_version 3 \
     --os_version 15.0.0 \
     --os_patch_level 2024-11 \
     -o "$DIST_DIR/boot.img"
-
 
 # Copy vendor_boot modules
 input_dir=$OUT_DIR
@@ -204,9 +240,7 @@ while read -r line; do
     cp "$input_dir/$line" "$output_dir/$filename"
     aarch64-linux-gnu-strip --strip-debug "$output_dir/$filename"
 
-done < <(awk '/^drivers\//{print $1}' < $OUT_DIR/modules.order)
-
-
+done < <(awk '{print $1}' < "$OUT_DIR/modules.order")
 cd $ROOT_DIR
 
 # Process kernel modules for vendor ramdisk
@@ -216,8 +250,55 @@ if [ -d "$DIST_DIR/lib/modules" ]; then
     TEMP_VENDOR_RAMDISK="$DIST_DIR/temp_vendor_ramdisk"
     mkdir -p "$TEMP_VENDOR_RAMDISK/lib/modules"
     
-    # Copy modules to ramdisk
+    # Copy modules to vendor ramdisk
     cp -r "$DIST_DIR/lib/modules"/* "$TEMP_VENDOR_RAMDISK/lib/modules/"
+
+    # Generate modules.dep
+    echo -e "${YELLOW}Generating modules.dep...${NC}"
+    python3 $GENERATE_MODULE_DEP "$TEMP_VENDOR_RAMDISK/lib/modules" \
+    --output "$TEMP_VENDOR_RAMDISK/lib/modules/modules.dep" \
+    --jobs "$JOBS"
+
+    # Generate modules.softdep
+    echo -e "${YELLOW}Generating modules.softdep...${NC}"
+    {
+        echo "# Soft dependencies extracted from modules themselves."
+        cd "$TEMP_VENDOR_RAMDISK"
+        for module in lib/modules/*.ko; do
+            if [ -f "$module" ]; then
+                # Get module name without path and .ko
+                module_name=$(basename "$module" .ko)
+                # Get softdeps using modinfo
+                softdeps=$(modinfo -F softdep "$module")
+                if [ -n "$softdeps" ]; then
+                    echo "softdep $module_name $softdeps"
+                fi
+            fi
+        done
+    } > "$TEMP_VENDOR_RAMDISK/lib/modules/modules.softdep"
+
+    # Generate modules.alias
+    echo -e "${YELLOW}Generating modules.alias...${NC}"
+    {
+        echo "# Aliases extracted from modules themselves."
+        cd "$TEMP_VENDOR_RAMDISK"
+        for module in lib/modules/*.ko; do
+            if [ -f "$module" ]; then
+                # Get module name without path and .ko
+                module_name=$(basename "$module" .ko)
+                # Get aliases using modinfo
+                modinfo -F alias "$module" | while read -r alias; do
+                    if [ -n "$alias" ]; then
+                        echo "alias $alias ${module_name//-/_}"
+                    fi
+                done
+            fi
+        done
+    } > "$TEMP_VENDOR_RAMDISK/lib/modules/modules.alias"
+
+    # Copy modules.load
+    echo -e "${YELLOW}Creating modules.load...${NC}"
+    cp $MODULES_LOAD $TEMP_VENDOR_RAMDISK/lib/modules/
 
     # Copy fstab file to vendor ramdisk
     if [ -f $FSTAB_FILE ]; then
@@ -236,9 +317,9 @@ if [ -d "$DIST_DIR/lib/modules" ]; then
     fi
 
     # Copy firmware to vendor ramdisk
-    if [ -d "$ROOT_DIR/vendor" ]; then
-        mkdir -p "$TEMP_VENDOR_RAMDISK/first_stage_ramdisk"
-        cp -r "$ROOT_DIR/vendor" "$TEMP_VENDOR_RAMDISK/"
+    if [ -d "$VENDOR_FIRMWARE_DIR" ]; then
+        mkdir -p "$TEMP_VENDOR_RAMDISK/vendor"
+        cp -r "$VENDOR_FIRMWARE_DIR" "$TEMP_VENDOR_RAMDISK/vendor"
     else
         echo -e "${YELLOW}Warning: Vendor folder not found in stock ramdisk. Proceeding without it.${NC}"
     fi
@@ -248,7 +329,7 @@ if [ -d "$DIST_DIR/lib/modules" ]; then
         find . | cpio -H newc -o | gzip > "$DIST_DIR/vendor_ramdisk.cpio.gz" && \
         cd - > /dev/null)
         
-    # Add vendor ramdisk to vendor_boot
+    # Build vendor_boot
     $MKBOOTIMG \
             --kernel "$OUT_DIR/arch/$ARCH/boot/Image" \
             --dtb "$DIST_DIR/dtb.img" \
@@ -270,7 +351,7 @@ fi
 sign_image "$DIST_DIR/boot.img" "boot" "67108864"
 
 # Sign vendor_boot.img
-sign_image "$DIST_DIR/vendor_boot.img" "vendor_boot" "67108864"  # Adjust partition 
+sign_image "$DIST_DIR/vendor_boot.img" "vendor_boot" "67108864"
 
 # Check if all required files exist
 if [ -f "$DIST_DIR/boot.img" ] && [ -f "$DIST_DIR/dtbo.img" ] && [ -f "$DIST_DIR/vendor_boot.img" ]; then
