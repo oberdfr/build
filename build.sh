@@ -38,10 +38,13 @@ NC='\033[0m'
 show_help() {
     echo "Usage: $0 [options]"
     echo "Options:"
-    echo "  -j    Number of jobs (default: number of CPU cores)"
-    echo "  -d    Device (o1s, p3s, t2s)"
-    echo "  -o    Output directory (default: out)"
-    echo "  -h    Show this help message"
+    echo "  -j                  Number of jobs (default: number of CPU cores)"
+    echo "  -d                  Device (o1s, p3s, t2s)"
+    echo "  -o                  Output directory (default: out)"
+    echo "  --prebuilt-dist     Create DEVICE-kernel folder to build AOSP"
+    echo "  --skip-build        Skip rebuilding the kernel"
+    echo "  -s                  Sign images"
+    echo "  -h                  Show this help message"
     exit 0
 }
 
@@ -49,14 +52,45 @@ generate_salt() {
     head -c 32 /dev/urandom | xxd -p -c 32
 }
 
+MAKE_DIST=false
+SIGN_IMAGES=false
+BUILD_KERNEL=true
+
 # Parse command line arguments
-while getopts "j:d:o:h" opt; do
-    case $opt in
-        j) JOBS="$OPTARG" ;;
-        d) DEVICE="$OPTARG" ;;
-        o) OUT_DIR="$OPTARG" ;;
-        h) show_help ;;
-        ?) show_help ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -j)
+            JOBS="$2"
+            shift 2
+            ;;
+        -d)
+            DEVICE="$2"
+            shift 2
+            ;;
+        -o)
+            OUT_DIR="$2"
+            shift 2
+            ;;
+        --prebuilt-dist)
+            MAKE_DIST=true
+            shift
+            ;;
+        --skip-build)
+            BUILD_KERNEL=false
+            shift
+            ;;
+        -s|--sign)
+            SIGN_IMAGES=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            show_help
+            exit 1
+            ;;
     esac
 done
 
@@ -139,19 +173,23 @@ if [ ! -f "$GKI_SIGNING_KEY" ] ; then
 fi
 
 # --- BUILD KERNEL --- #
-cd $KERNEL_DIR
-# 1. Generate defconfig
-echo -e "${YELLOW}Generating defconfig...${NC}"
-make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG"
+if [ "$BUILD_KERNEL" = "true" ]; then
+    cd $KERNEL_DIR
+    # 1. Generate defconfig
+    echo -e "${YELLOW}Generating defconfig...${NC}"
+    make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG"
 
-# 2. Build kernel
-echo -e "${YELLOW}Building kernel image...${NC}"
-make O="$OUT_DIR" ARCH="$ARCH" -j"$JOBS"
+    # 2. Build kernel
+    echo -e "${YELLOW}Building kernel image...${NC}"
+    make O="$OUT_DIR" ARCH="$ARCH" -j"$JOBS"
 
-cd $ROOT_DIR
-# --- BUILD KERNEL END --- #
+    cd $ROOT_DIR
+    echo -e "${GREEN}Kernel build completed successfully.${NC}"
+else
+    echo -e "${CYAN}Skipping kernel build as BUILD_KERNEL is not set to true.${NC}"
+fi
 
-# 3. Build DTBO image
+# Build DTBO image
 echo -e "${YELLOW}Building DTBO image...${NC}"
 if [ -f "$MKDTIMG" ]; then
     mkdir -p "$DIST_DIR/dtbo"
@@ -171,7 +209,7 @@ else
     exit 1
 fi
 
-# 4. Build DTB image
+# Build DTB image
 echo -e "${YELLOW}Building DTB image...${NC}"
 if [ -f "$DT_CONFIGS/exynos2100.cfg" ]; then
     mkdir -p "$DIST_DIR/dtb"
@@ -214,7 +252,7 @@ else
     exit 1
 fi
 
-# 5. Create boot.img with ramdisk
+# Create boot.img with ramdisk
 echo -e "${YELLOW}Creating boot.img...${NC}"
 $MKBOOTIMG \
     --kernel "$OUT_DIR/arch/$ARCH/boot/Image" \
@@ -347,11 +385,13 @@ if [ -d "$DIST_DIR/lib/modules" ]; then
     rm -rf "$TEMP_VENDOR_RAMDISK"
 fi
 
-# Sign boot.img
-sign_image "$DIST_DIR/boot.img" "boot" "67108864"
+if [ "$SIGN_IMAGES" = "true" ]; then
+    # Sign boot.img
+    sign_image "$DIST_DIR/boot.img" "boot" "67108864"
 
-# Sign vendor_boot.img
-sign_image "$DIST_DIR/vendor_boot.img" "vendor_boot" "67108864"
+    # Sign vendor_boot.img
+    sign_image "$DIST_DIR/vendor_boot.img" "vendor_boot" "67108864"
+fi
 
 # Check if all required files exist
 if [ -f "$DIST_DIR/boot.img" ] && [ -f "$DIST_DIR/dtbo.img" ] && [ -f "$DIST_DIR/vendor_boot.img" ]; then
@@ -364,4 +404,27 @@ if [ -f "$DIST_DIR/boot.img" ] && [ -f "$DIST_DIR/dtbo.img" ] && [ -f "$DIST_DIR
 else
     echo -e "\n${RED}Build failed: Some output files are missing${NC}"
     exit 1
+fi
+
+if [ "$MAKE_DIST" = "true" ]; then
+    echo -e "\n${YELLOW}Preparing distribution files for ${DEVICE}-kernel...${NC}"
+    
+    DIST_KERNEL_DIR="$ROOT_DIR/${DEVICE}-kernel"
+    mkdir -p "$DIST_KERNEL_DIR/lib/modules"
+    
+    # Move lib/modules
+    if [ -d "$DIST_DIR/lib/modules" ]; then
+        cp "$DIST_DIR/lib/modules/"* "$DIST_KERNEL_DIR/lib/modules"
+        echo -e "${GREEN}Modules moved to ${DIST_KERNEL_DIR}/lib/modules${NC}"
+    else
+        echo -e "${RED}Error: Modules directory not found in ${DIST_DIR}/lib/modules${NC}"
+        exit 1
+    fi
+
+    # Move DTBO, DTB, and kernel image
+    cp "$DIST_DIR/dtbo.img" "$DIST_KERNEL_DIR/" || echo -e "${RED}Error: dtbo.img not found.${NC}"
+    cp "$DIST_DIR/dtb.img" "$DIST_KERNEL_DIR/" || echo -e "${RED}Error: dtb.img not found.${NC}"
+    cp "$OUT_DIR/arch/$ARCH/boot/Image" "$DIST_KERNEL_DIR/" || echo -e "${RED}Error: Kernel image not found.${NC}"
+
+    echo -e "${GREEN}Distribution files successfully prepared in ${DIST_KERNEL_DIR}${NC}"
 fi
